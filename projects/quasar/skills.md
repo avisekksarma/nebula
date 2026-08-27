@@ -6,9 +6,9 @@ Goal:
 - We have only 3 days, so keep the implementation focused and avoid unnecessary features.
 
 Current stage:
-- Three nodes, manually configured --leader. Only the leader accepts client PUT/DELETE.
-- Leader naively broadcasts writes via /internal/kv. GET is local.
-- Step 2 of election: followers become candidate after a randomized timeout. No votes, no automatic leader yet.
+- Three nodes elect a leader (follower/candidate/leader, term, heartbeats, votes, majority).
+- Every node starts as follower. Higher term (incoming RPC or reply) steps down to follower.
+- Only the current leader accepts PUT/DELETE; KV fan-out is still naive. GET is local.
 - There is NO Raft log, commit index, persistence, or Docker yet.
 
 Development philosophy:
@@ -31,6 +31,6 @@ single-node KV
 → failure testing
 → persistence/recovery if time permits.
 
-For now, stay at candidate-on-timeout (manual --leader, no votes) unless I explicitly ask to move forward.
+For now, stay at leader election (no Raft log) unless I explicitly ask to move forward.
 
 Also, I am using ChatGPT separately to learn the distributed-systems concepts, so don't turn this into a long theory lesson. Help me implement and debug the current stage.
