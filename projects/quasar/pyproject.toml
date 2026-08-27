@@ -1,0 +1,19 @@
+[project]
+name = "quasar"
+version = "0.1.0"
+description = "A distributed, replicated key-value store"
+readme = "README.md"
+authors = [
+    { name = "Abhishek Sharma", email = "avisekksarma@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi[standard]>=0.141.1",
+]
+
+[project.scripts]
+quasar = "quasar:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"

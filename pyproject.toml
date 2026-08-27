@@ -1,0 +1,21 @@
+[project]
+name = "nebula"
+version = "0.1.0"
+description = "A collection of distributed systems projects"
+readme = "README.md"
+authors = [
+    { name = "Abhishek Sharma", email = "avisekksarma@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["projects/*"]
+
+[tool.uv]
+package = false
+
+[tool.basedpyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.13"
