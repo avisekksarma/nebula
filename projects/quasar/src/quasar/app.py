@@ -10,12 +10,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# Step 4 of election: always start as follower; higher term → step down.
 _HEARTBEAT_INTERVAL = 0.25
 _ELECTION_TIMEOUT_MIN = 0.8
 _ELECTION_TIMEOUT_MAX = 1.6
 
 _store: dict[str, str] = {}
+_log: list[dict[str, str | int]] = []
+_commit_index = 0
+_last_applied = 0
 _lock = threading.Lock()
 _stop = threading.Event()
 _role = "follower"
@@ -91,12 +93,116 @@ def _majority() -> int:
     return _cluster_size() // 2 + 1
 
 
-def _apply_put(key: str, value: str) -> None:
-    _store[key] = value
+def _apply_entry(entry: dict[str, str | int]) -> None:
+    op = str(entry["operation"])
+    key = str(entry["key"])
+    if op == "PUT":
+        _store[key] = str(entry["value"])
+    elif op == "DELETE":
+        _store.pop(key, None)
 
 
-def _apply_delete(key: str) -> None:
-    _store.pop(key, None)
+def _apply_committed() -> None:
+    global _last_applied
+    while _last_applied < _commit_index:
+        _last_applied += 1
+        entry = _log[_last_applied - 1]
+        _apply_entry(entry)
+        print(f"{_node_id()}: apply {entry} (commit_index={_commit_index})", flush=True)
+
+
+def _advance_commit_from_leader(leader_commit: int) -> None:
+    global _commit_index
+    new = min(leader_commit, len(_log))
+    if new > _commit_index:
+        _commit_index = new
+    _apply_committed()
+
+
+def _append_log(operation: str, key: str, value: str | None = None) -> dict[str, str | int]:
+    with _lock:
+        entry: dict[str, str | int] = {
+            "index": len(_log) + 1,
+            "term": _term,
+            "operation": operation,
+            "key": key,
+        }
+        if value is not None:
+            entry["value"] = value
+        _log.append(entry)
+        print(f"{_node_id()}: log append {entry}", flush=True)
+        return entry
+
+
+def _send_suffix(addr: str, last_log_index: int) -> None:
+    with _lock:
+        missing = list(_log[last_log_index:])
+        leader_commit = _commit_index
+    if not missing:
+        return
+    print(
+        f"{_node_id()}: catch-up {addr} sending indexes "
+        f"{missing[0]['index']}-{missing[-1]['index']}",
+        flush=True,
+    )
+    for entry in missing:
+        _http_json(
+            "POST",
+            f"{addr}/internal/append",
+            {"entry": entry, "leader_commit": leader_commit},
+            timeout=1.0,
+        )
+
+
+def _replicate_log(entry: dict[str, str | int]) -> list[str]:
+    with _lock:
+        leader_commit = _commit_index
+    failed: list[str] = []
+    for node_id, addr in _other_peers().items():
+        try:
+            reply = _http_json(
+                "POST",
+                f"{addr}/internal/append",
+                {"entry": entry, "leader_commit": leader_commit},
+                timeout=1.0,
+            )
+            last = int(reply.get("last_log_index", 0))
+            if last < int(entry["index"]):
+                _send_suffix(addr, last)
+        except urllib.error.URLError as exc:
+            print(f"log replication to {node_id} failed: {exc}", flush=True)
+            failed.append(node_id)
+    return failed
+
+
+def _push_commit_index() -> None:
+    with _lock:
+        leader_commit = _commit_index
+    for node_id, addr in _other_peers().items():
+        try:
+            _http_json(
+                "POST",
+                f"{addr}/internal/append",
+                {"leader_commit": leader_commit},
+                timeout=1.0,
+            )
+        except urllib.error.URLError:
+            print(f"commit push to {node_id} failed", flush=True)
+
+
+def _maybe_commit(index: int, acks: int) -> None:
+    global _commit_index
+    if acks < _majority():
+        return
+    with _lock:
+        if index > _commit_index:
+            _commit_index = index
+            print(
+                f"{_node_id()}: commit_index={_commit_index} (acks={acks}/{_majority()})",
+                flush=True,
+            )
+        _apply_committed()
+    _push_commit_index()
 
 
 def _http_json(
@@ -108,17 +214,6 @@ def _http_json(
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode()
         return json.loads(raw) if raw else {}
-
-
-def _fanout(method: str, path: str, payload: dict | None = None) -> list[str]:
-    failed: list[str] = []
-    for node_id, addr in _other_peers().items():
-        try:
-            _http_json(method, f"{addr}{path}", payload)
-        except urllib.error.URLError as exc:
-            print(f"replication to {node_id} failed: {exc}", flush=True)
-            failed.append(node_id)
-    return failed
 
 
 def _reset_election_timeout() -> None:
@@ -147,7 +242,8 @@ def _send_heartbeats() -> None:
     with _lock:
         term = _term
         me = _node_id()
-    payload = {"term": term, "leader_id": me}
+        leader_commit = _commit_index
+    payload = {"term": term, "leader_id": me, "leader_commit": leader_commit}
     for node_id, addr in _other_peers().items():
         try:
             reply = _http_json(
@@ -160,6 +256,13 @@ def _send_heartbeats() -> None:
             if their_term > _term:
                 _become_follower(their_term)
                 return
+            n = len(_log)
+        last = int(reply.get("last_log_index", 0))
+        if last < n:
+            try:
+                _send_suffix(addr, last)
+            except urllib.error.URLError:
+                continue
 
 
 def _start_election() -> None:
@@ -235,11 +338,17 @@ class InternalMessage(BaseModel):
 class HeartbeatBody(BaseModel):
     term: int
     leader_id: str
+    leader_commit: int = 0
 
 
 class VoteBody(BaseModel):
     term: int
     candidate_id: str
+
+
+class AppendBody(BaseModel):
+    entry: dict[str, str | int] | None = None
+    leader_commit: int = 0
 
 
 @app.get("/health")
@@ -253,6 +362,7 @@ def health() -> dict[str, str | int | bool | None]:
             "term": _term,
             "leader": _leader,
             "leader_alive": True if _role == "leader" else _leader_alive,
+            "commit_index": _commit_index,
         }
 
 
@@ -267,44 +377,89 @@ def root() -> dict[str, str | int | bool | None]:
             "leader": _leader,
             "leader_alive": True if _role == "leader" else _leader_alive,
             "keys": len(_store),
+            "commit_index": _commit_index,
+        }
+
+
+@app.get("/log")
+def get_log() -> dict[str, object]:
+    with _lock:
+        return {
+            "node": _node_id(),
+            "role": _role,
+            "term": _term,
+            "commit_index": _commit_index,
+            "entries": list(_log),
         }
 
 
 @app.put("/kv/{key}")
 def put(key: str, body: PutBody) -> dict[str, object]:
     _require_leader()
-    _apply_put(key, body.value)
-    failed = _fanout("PUT", f"/internal/kv/{key}", {"value": body.value})
-    return {"key": key, "value": body.value, "replication_failed": failed}
+    entry = _append_log("PUT", key, body.value)
+    log_failed = _replicate_log(entry)
+    acks = 1 + len(_other_peers()) - len(log_failed)
+    _maybe_commit(int(entry["index"]), acks)
+    with _lock:
+        commit_index = _commit_index
+    return {
+        "key": key,
+        "value": body.value,
+        "log": entry,
+        "commit_index": commit_index,
+        "log_replication_failed": log_failed,
+    }
 
 
 @app.get("/kv/{key}")
 def get(key: str) -> dict[str, str]:
-    if key not in _store:
-        raise HTTPException(status_code=404, detail="key not found")
-    return {"key": key, "value": _store[key]}
+    with _lock:
+        if key not in _store:
+            raise HTTPException(status_code=404, detail="key not found")
+        return {"key": key, "value": _store[key]}
 
 
 @app.delete("/kv/{key}")
 def delete(key: str) -> dict[str, object]:
     _require_leader()
-    if key not in _store:
-        raise HTTPException(status_code=404, detail="key not found")
-    _apply_delete(key)
-    failed = _fanout("DELETE", f"/internal/kv/{key}")
-    return {"deleted": key, "replication_failed": failed}
+    with _lock:
+        if key not in _store:
+            raise HTTPException(status_code=404, detail="key not found")
+    entry = _append_log("DELETE", key)
+    log_failed = _replicate_log(entry)
+    acks = 1 + len(_other_peers()) - len(log_failed)
+    _maybe_commit(int(entry["index"]), acks)
+    with _lock:
+        commit_index = _commit_index
+    return {
+        "deleted": key,
+        "log": entry,
+        "commit_index": commit_index,
+        "log_replication_failed": log_failed,
+    }
 
 
-@app.put("/internal/kv/{key}")
-def replicate_put(key: str, body: PutBody) -> dict[str, str]:
-    _apply_put(key, body.value)
-    return {"applied": "put", "key": key, "node": _node_id()}
-
-
-@app.delete("/internal/kv/{key}")
-def replicate_delete(key: str) -> dict[str, str]:
-    _apply_delete(key)
-    return {"applied": "delete", "key": key, "node": _node_id()}
+@app.post("/internal/append")
+def receive_append(body: AppendBody) -> dict[str, object]:
+    with _lock:
+        if body.entry is not None:
+            idx = int(body.entry["index"])
+            expected = len(_log) + 1
+            if idx == expected:
+                _log.append(dict(body.entry))
+                print(f"{_node_id()}: log append {body.entry}", flush=True)
+            elif idx > expected:
+                print(
+                    f"{_node_id()}: skip gap index={idx} expected={expected}",
+                    flush=True,
+                )
+        _advance_commit_from_leader(body.leader_commit)
+        return {
+            "appended": body.entry is not None,
+            "node": _node_id(),
+            "commit_index": _commit_index,
+            "last_log_index": len(_log),
+        }
 
 
 @app.post("/internal/heartbeat")
@@ -312,7 +467,11 @@ def receive_heartbeat(body: HeartbeatBody) -> dict[str, object]:
     global _role, _term, _leader, _leader_alive
     with _lock:
         if body.term < _term:
-            return {"term": _term, "success": False}
+            return {
+                "term": _term,
+                "success": False,
+                "last_log_index": len(_log),
+            }
         if body.term > _term or _role in ("leader", "candidate"):
             _become_follower(body.term)
         _term = body.term
@@ -320,7 +479,12 @@ def receive_heartbeat(body: HeartbeatBody) -> dict[str, object]:
         _leader = body.leader_id
         _leader_alive = True
         _reset_election_timeout()
-        return {"term": _term, "success": True}
+        _advance_commit_from_leader(body.leader_commit)
+        return {
+            "term": _term,
+            "success": True,
+            "last_log_index": len(_log),
+        }
 
 
 @app.post("/internal/vote")

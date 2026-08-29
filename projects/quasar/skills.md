@@ -6,10 +6,9 @@ Goal:
 - We have only 3 days, so keep the implementation focused and avoid unnecessary features.
 
 Current stage:
-- Three nodes elect a leader (follower/candidate/leader, term, heartbeats, votes, majority).
-- Every node starts as follower. Higher term (incoming RPC or reply) steps down to follower.
-- Only the current leader accepts PUT/DELETE; KV fan-out is still naive. GET is local.
-- There is NO Raft log, commit index, persistence, or Docker yet.
+- Three nodes elect a leader. Leader appends PUT/DELETE to the log and replicates via POST /internal/append.
+- Majority (2 of 3) advances commit_index. Committed entries are applied to the KV dict (once). Followers learn commit_index from append/heartbeat.
+- Direct KV fan-out is gone. Leader catch-up: if a follower's log is a shorter prefix, send the missing suffix. No conflict resolution, persistence, or snapshots yet.
 
 Development philosophy:
 1. Do NOT implement future distributed-system features unless explicitly asked.
@@ -31,6 +30,6 @@ single-node KV
 → failure testing
 → persistence/recovery if time permits.
 
-For now, stay at leader election (no Raft log) unless I explicitly ask to move forward.
+For now, stay at prefix catch-up (no log conflicts) unless I explicitly ask to move forward.
 
 Also, I am using ChatGPT separately to learn the distributed-systems concepts, so don't turn this into a long theory lesson. Help me implement and debug the current stage.
