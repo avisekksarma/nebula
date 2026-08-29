@@ -331,10 +331,6 @@ class PutBody(BaseModel):
     value: str
 
 
-class InternalMessage(BaseModel):
-    message: str
-
-
 class HeartbeatBody(BaseModel):
     term: int
     leader_id: str
@@ -362,21 +358,6 @@ def health() -> dict[str, str | int | bool | None]:
             "term": _term,
             "leader": _leader,
             "leader_alive": True if _role == "leader" else _leader_alive,
-            "commit_index": _commit_index,
-        }
-
-
-@app.get("/")
-def root() -> dict[str, str | int | bool | None]:
-    with _lock:
-        return {
-            "name": "quasar",
-            "node": _node_id(),
-            "role": _role,
-            "term": _term,
-            "leader": _leader,
-            "leader_alive": True if _role == "leader" else _leader_alive,
-            "keys": len(_store),
             "commit_index": _commit_index,
         }
 
@@ -504,24 +485,3 @@ def receive_vote(body: VoteBody) -> dict[str, object]:
                 flush=True,
             )
         return {"term": _term, "vote_granted": granted}
-
-
-@app.post("/internal/message")
-def receive_internal(body: InternalMessage) -> dict[str, str]:
-    return {"received_by": _node_id(), "message": body.message}
-
-
-@app.post("/internal/send/{target}")
-def send_internal(target: str, body: InternalMessage) -> dict[str, object]:
-    addr = _peers().get(target)
-    if addr is None:
-        raise HTTPException(status_code=404, detail=f"unknown peer {target}")
-
-    try:
-        peer_reply = _http_json(
-            "POST", f"{addr}/internal/message", {"message": body.message}
-        )
-    except urllib.error.URLError as exc:
-        raise HTTPException(status_code=502, detail=f"peer unreachable: {exc}") from exc
-
-    return {"from": _node_id(), "to": target, "response": peer_reply}

@@ -97,7 +97,6 @@ Wait about two seconds for election. Stdout shows `candidate` / `granted vote` /
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/health` | `role`, `term`, `leader`, `commit_index` |
-| `GET` | `/` | Cluster summary and key count |
 | `GET` | `/log` | Log entries and `commit_index` |
 | `PUT` | `/kv/{key}` | JSON body `{"value": "..."}` |
 | `GET` | `/kv/{key}` | Read committed value |
