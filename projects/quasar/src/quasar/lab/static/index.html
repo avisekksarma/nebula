@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Quasar lab</title>
+    <link rel="stylesheet" href="/assets/lab.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <h1>Quasar lab</h1>
+        <p class="sub">The real 3-node cluster, with the hood open</p>
+      </div>
+      <div class="top-end">
+        <p id="pulse" class="pulse">connecting…</p>
+        <a class="how-btn" href="/how">How this works</a>
+      </div>
+    </header>
+
+    <p id="narration" class="narration">
+      Three nodes will elect a leader. Majority is two. A write is a log entry
+      first; the map is derived from committed entries only.
+    </p>
+
+    <div class="shell">
+      <aside class="panel">
+        <h2>Client</h2>
+        <form id="kv-form" class="kv-form">
+          <label>
+            Key
+            <input id="kv-key" name="key" value="x" autocomplete="off" />
+          </label>
+          <label>
+            Value
+            <input id="kv-value" name="value" value="10" autocomplete="off" />
+          </label>
+          <label>
+            Send to
+            <select id="kv-node">
+              <option value="">leader (auto)</option>
+              <option value="A">A</option>
+              <option value="B">B</option>
+              <option value="C">C</option>
+            </select>
+          </label>
+          <div class="row">
+            <button type="submit" data-op="put">PUT</button>
+            <button type="button" data-op="get">GET</button>
+            <button type="button" data-op="delete">DELETE</button>
+          </div>
+        </form>
+        <pre id="kv-result" class="result">PUT / GET / DELETE go through the lab to a real node.</pre>
+
+        <h2>Scenarios</h2>
+        <p class="hint">
+          Each one drives the live cluster. Watch the cards and the event log.
+        </p>
+        <div class="scenarios">
+          <button type="button" data-scenario="election">
+            1. Watch an election
+          </button>
+          <button type="button" data-scenario="write">
+            2. A write is a log entry
+          </button>
+          <button type="button" data-scenario="majority">
+            3. Majority of two
+          </button>
+          <button type="button" data-scenario="catchup">
+            4. Kill the leader, then catch-up
+          </button>
+        </div>
+        <button type="button" id="resume-all" class="ghost">Resume all</button>
+      </aside>
+
+      <div class="main">
+        <section id="nodes" class="nodes"></section>
+        <section class="timeline-wrap">
+          <h2>Event log</h2>
+          <ol id="timeline"></ol>
+        </section>
+      </div>
+    </div>
+
+    <script src="/assets/lab.js"></script>
+  </body>
+</html>

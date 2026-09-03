@@ -92,6 +92,37 @@ Wait about two seconds for election. Stdout shows `candidate` / `granted vote` /
 | `--port` | `8000` | Bind port |
 | `--peers` | (empty) | All nodes as `id=url`, comma-separated. Include this node; it is skipped locally. |
 
+## Interactive lab
+
+The lab is a website on top of the **same** three-node cluster. It does not implement another KV store or another election. `quasar-lab` starts the real `quasar` processes (A, B, C on 8001–8003) and a site on port 9000.
+
+```bash
+uv run --package quasar quasar-lab
+```
+
+Open [http://127.0.0.1:9000](http://127.0.0.1:9000). Do not also start the three `quasar` commands in the Run section — they bind the same ports.
+
+What used to be curl and extra terminals is on the page:
+
+| On the site | Same as |
+| --- | --- |
+| Three cards (role, term, log, KV map) | `curl /health` and `/log` on each port |
+| PUT / GET / DELETE | `curl` to `/kv/{key}` (leader, or a node you pick — followers still return **409**) |
+| Pause / Resume | Stop a process, then bring it back with its RAM still there |
+| Restart | Kill and start again — empty log and map until catch-up |
+| Event list | The `candidate` / `granted vote` / `leader` / `apply` lines in stdout |
+
+Guided buttons chain those same actions:
+
+1. **Watch an election** — all three start as followers; a candidate needs two votes to become leader.
+2. **A write is a log entry** — PUT, then watch append → replicate → majority commit → apply to the map. GET reads the map, not the uncommitted tail of the log.
+3. **Majority of two** — pause one follower (write still commits); pause two (entry stays on the log but is not applied).
+4. **Kill the leader, then catch-up** — pause a follower, write, resume (it gets the missing log suffix); pause the leader and wait for a new election.
+
+You can still curl `8001`–`8003` in another terminal. That is the same cluster; the site refreshes on its own. Writes still have to go to whoever `/health` reports as `leader`.
+
+`--host` and `--port` default to `127.0.0.1` and `9000`. Local only; not a hosted multi-user service.
+
 ## API
 
 | Method | Path | Description |
@@ -135,7 +166,11 @@ projects/quasar/
 ├── README.md
 ├── pyproject.toml
 └── src/quasar/
-    ├── __init__.py    # CLI
+    ├── __init__.py    # node CLI
     ├── __main__.py
-    └── app.py
+    ├── app.py         # cluster / KV backend
+    └── lab/           # interactive website (not part of the node)
+        ├── __init__.py
+        ├── server.py
+        └── static/
 ```

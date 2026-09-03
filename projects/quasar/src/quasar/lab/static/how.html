@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>How Quasar works</title>
+    <link rel="stylesheet" href="/assets/lab.css" />
+  </head>
+  <body class="how">
+    <header class="top">
+      <div class="brand">
+        <h1>How this works</h1>
+        <p class="sub">Three copies of the same store, one agreed history</p>
+      </div>
+      <div class="top-end">
+        <a class="how-btn" href="/">Back to the lab</a>
+      </div>
+    </header>
+
+    <p class="narration">
+      Quasar is a tiny replicated key-value store. A, B, and C each keep a
+      <span class="k">log</span> (the ordered history) and a
+      <span class="k">map</span> (what GET reads). The map is not copied around
+      by itself — it is rebuilt from log entries that a majority has accepted.
+    </p>
+
+    <div class="how-grid">
+      <article class="how-card">
+        <h2>Why a log</h2>
+        <p>
+          Putting <code>x=10</code> into every dict works while everyone is up.
+          It does not agree on <strong>order</strong>, or which writes survive a
+          crash.
+        </p>
+        <p>
+          So a write is: append to the leader’s log, copy that entry, then —
+          only after two of three nodes have it — mark it
+          <span class="k">committed</span> and apply it to the map.
+        </p>
+      </article>
+
+      <article class="how-card">
+        <h2>Who leads</h2>
+        <p>
+          Everyone starts as a <span class="k">follower</span>. The leader
+          heartbeats every 250ms. If a follower hears nothing for about a
+          second, it becomes a <span class="k">candidate</span>: new
+          <span class="k">term</span>, vote for itself, ask the others.
+        </p>
+        <p>
+          One vote per term. Two votes win. A higher term makes a stale leader
+          step down. PUT and DELETE go only to the current leader; a follower
+          answers 409.
+        </p>
+      </article>
+
+      <article class="how-card">
+        <h2>A write, in order</h2>
+        <ol>
+          <li>Leader appends PUT/DELETE to its log.</li>
+          <li>It copies the entry to the others.</li>
+          <li>Majority (2 of 3) → <code>commit_index</code> moves.</li>
+          <li>Each node applies committed entries, in index order, to its map.</li>
+          <li>GET reads the map, never the uncommitted tail of the log.</li>
+        </ol>
+      </article>
+    </div>
+
+    <div class="how-strip">
+      <article class="how-card">
+        <h2>Majority of two</h2>
+        <p>
+          Leader + one live follower can commit. One dead node does not stall
+          the cluster. Two dead nodes cannot form a majority — the entry sits on
+          the log and the map does not change.
+        </p>
+      </article>
+      <article class="how-card">
+        <h2>A node that was down</h2>
+        <p>
+          Restart wipes RAM (empty log and map). If that log is still a prefix
+          of the leader’s, the leader sends the missing suffix. Catch-up is
+          “here are the operations you missed,” not “here is an opaque dump of
+          the dict.”
+        </p>
+      </article>
+    </div>
+
+    <p class="how-note">
+      The lab is this cluster with the hood open — same processes as curl to
+      ports 8001–8003. Open the site and try a write, pause a follower, then
+      kill the leader.
+    </p>
+  </body>
+</html>
