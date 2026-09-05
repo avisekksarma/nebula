@@ -6,9 +6,9 @@ Goal:
 - We have only 3 days, so keep the implementation focused and avoid unnecessary features.
 
 Current stage:
-- Three nodes elect a leader. Leader appends PUT/DELETE to the log and replicates via POST /internal/append.
+- Three nodes elect a leader. Leader appends PUT/DELETE to the log and replicates via POST /internal/append (prev_log_index / prev_log_term, entries).
 - Majority (2 of 3) advances commit_index. Committed entries are applied to the KV dict (once). Followers learn commit_index from append/heartbeat.
-- Direct KV fan-out is gone. Leader catch-up: if a follower's log is a shorter prefix, send the missing suffix. No conflict resolution, persistence, or snapshots yet.
+- Leader tracks next_index per follower. Prefix mismatch: decrement and retry. Conflicting uncommitted suffix is replaced. No persistence or snapshots yet.
 
 Development philosophy:
 1. Do NOT implement future distributed-system features unless explicitly asked.
@@ -30,6 +30,6 @@ single-node KV
 → failure testing
 → persistence/recovery if time permits.
 
-For now, stay at prefix catch-up (no log conflicts) unless I explicitly ask to move forward.
+For now, stay at log conflict repair (next_index + suffix replace) unless I explicitly ask to move forward.
 
 Also, I am using ChatGPT separately to learn the distributed-systems concepts, so don't turn this into a long theory lesson. Help me implement and debug the current stage.

@@ -8,7 +8,7 @@ import urllib.request
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 _HEARTBEAT_INTERVAL = 0.25
 _ELECTION_TIMEOUT_MIN = 0.8
@@ -27,6 +27,7 @@ _leader: str | None = None
 _last_heard = 0.0
 _leader_alive = False
 _election_timeout = 1.0
+_next_index: dict[str, int] = {}
 
 
 @asynccontextmanager
@@ -111,6 +112,26 @@ def _apply_committed() -> None:
         print(f"{_node_id()}: apply {entry} (commit_index={_commit_index})", flush=True)
 
 
+def _last_log_meta() -> tuple[int, int]:
+    if not _log:
+        return 0, 0
+    return len(_log), int(_log[-1]["term"])
+
+
+def _term_at(index: int) -> int:
+    if index <= 0 or index > len(_log):
+        return 0
+    return int(_log[index - 1]["term"])
+
+
+def _prefix_matches(prev_log_index: int, prev_log_term: int) -> bool:
+    if prev_log_index == 0:
+        return True
+    if prev_log_index > len(_log):
+        return False
+    return int(_log[prev_log_index - 1]["term"]) == prev_log_term
+
+
 def _advance_commit_from_leader(leader_commit: int) -> None:
     global _commit_index
     new = min(leader_commit, len(_log))
@@ -134,60 +155,62 @@ def _append_log(operation: str, key: str, value: str | None = None) -> dict[str,
         return entry
 
 
-def _send_suffix(addr: str, last_log_index: int) -> None:
-    with _lock:
-        missing = list(_log[last_log_index:])
-        leader_commit = _commit_index
-    if not missing:
-        return
-    print(
-        f"{_node_id()}: catch-up {addr} sending indexes "
-        f"{missing[0]['index']}-{missing[-1]['index']}",
-        flush=True,
-    )
-    for entry in missing:
-        _http_json(
-            "POST",
-            f"{addr}/internal/append",
-            {"entry": entry, "leader_commit": leader_commit},
-            timeout=1.0,
-        )
-
-
-def _replicate_log(entry: dict[str, str | int]) -> list[str]:
-    with _lock:
-        leader_commit = _commit_index
-    failed: list[str] = []
-    for node_id, addr in _other_peers().items():
+def _send_append_entries(node_id: str, addr: str) -> bool:
+    while True:
+        with _lock:
+            if _role != "leader":
+                return False
+            last = len(_log)
+            ni = min(_next_index.get(node_id, last + 1), last + 1)
+            _next_index[node_id] = ni
+            prev_index = ni - 1
+            prev_term = _term_at(prev_index)
+            entries = [dict(e) for e in _log[prev_index:]]
+            payload = {
+                "term": _term,
+                "leader_id": _node_id(),
+                "prev_log_index": prev_index,
+                "prev_log_term": prev_term,
+                "entries": entries,
+                "leader_commit": _commit_index,
+            }
         try:
             reply = _http_json(
-                "POST",
-                f"{addr}/internal/append",
-                {"entry": entry, "leader_commit": leader_commit},
-                timeout=1.0,
+                "POST", f"{addr}/internal/append", payload, timeout=1.0
             )
-            last = int(reply.get("last_log_index", 0))
-            if last < int(entry["index"]):
-                _send_suffix(addr, last)
         except urllib.error.URLError as exc:
             print(f"log replication to {node_id} failed: {exc}", flush=True)
+            return False
+        with _lock:
+            their_term = int(reply.get("term", 0))
+            if their_term > _term:
+                _become_follower(their_term)
+                return False
+            if _role != "leader":
+                return False
+            if reply.get("success"):
+                _next_index[node_id] = ni + len(entries)
+                return True
+            if ni <= 1:
+                return False
+            _next_index[node_id] = ni - 1
+            print(
+                f"{_node_id()}: append to {node_id} rejected, next_index={ni - 1}",
+                flush=True,
+            )
+
+
+def _replicate_log() -> list[str]:
+    failed: list[str] = []
+    for node_id, addr in _other_peers().items():
+        if not _send_append_entries(node_id, addr):
             failed.append(node_id)
     return failed
 
 
 def _push_commit_index() -> None:
-    with _lock:
-        leader_commit = _commit_index
     for node_id, addr in _other_peers().items():
-        try:
-            _http_json(
-                "POST",
-                f"{addr}/internal/append",
-                {"leader_commit": leader_commit},
-                timeout=1.0,
-            )
-        except urllib.error.URLError:
-            print(f"commit push to {node_id} failed", flush=True)
+        _send_append_entries(node_id, addr)
 
 
 def _maybe_commit(index: int, acks: int) -> None:
@@ -239,34 +262,15 @@ def _become_follower(new_term: int | None = None) -> None:
 
 
 def _send_heartbeats() -> None:
-    with _lock:
-        term = _term
-        me = _node_id()
-        leader_commit = _commit_index
-    payload = {"term": term, "leader_id": me, "leader_commit": leader_commit}
     for node_id, addr in _other_peers().items():
-        try:
-            reply = _http_json(
-                "POST", f"{addr}/internal/heartbeat", payload, timeout=1.0
-            )
-        except urllib.error.URLError:
-            continue
         with _lock:
-            their_term = int(reply.get("term", 0))
-            if their_term > _term:
-                _become_follower(their_term)
+            if _role != "leader":
                 return
-            n = len(_log)
-        last = int(reply.get("last_log_index", 0))
-        if last < n:
-            try:
-                _send_suffix(addr, last)
-            except urllib.error.URLError:
-                continue
+        _send_append_entries(node_id, addr)
 
 
 def _start_election() -> None:
-    global _role, _term, _voted_for, _leader, _leader_alive
+    global _role, _term, _voted_for, _leader, _leader_alive, _next_index
     with _lock:
         if _role == "leader":
             return
@@ -277,6 +281,7 @@ def _start_election() -> None:
         _leader = None
         _leader_alive = False
         term = _term
+        last_log_index, last_log_term = _last_log_meta()
         _reset_election_timeout()
         print(f"{me}: candidate term={term} (requesting votes)", flush=True)
 
@@ -287,7 +292,12 @@ def _start_election() -> None:
             reply = _http_json(
                 "POST",
                 f"{addr}/internal/vote",
-                {"term": term, "candidate_id": me},
+                {
+                    "term": term,
+                    "candidate_id": me,
+                    "last_log_index": last_log_index,
+                    "last_log_term": last_log_term,
+                },
                 timeout=1.0,
             )
         except urllib.error.URLError as exc:
@@ -307,6 +317,7 @@ def _start_election() -> None:
                     _role = "leader"
                     _leader = me
                     _leader_alive = True
+                    _next_index = {nid: len(_log) + 1 for nid in _other_peers()}
                     print(f"{me}: leader term={term}", flush=True)
                     break
 
@@ -340,10 +351,16 @@ class HeartbeatBody(BaseModel):
 class VoteBody(BaseModel):
     term: int
     candidate_id: str
+    last_log_index: int = 0
+    last_log_term: int = 0
 
 
 class AppendBody(BaseModel):
-    entry: dict[str, str | int] | None = None
+    term: int = 0
+    leader_id: str = ""
+    prev_log_index: int = 0
+    prev_log_term: int = 0
+    entries: list[dict[str, str | int]] = Field(default_factory=list)
     leader_commit: int = 0
 
 
@@ -378,7 +395,7 @@ def get_log() -> dict[str, object]:
 def put(key: str, body: PutBody) -> dict[str, object]:
     _require_leader()
     entry = _append_log("PUT", key, body.value)
-    log_failed = _replicate_log(entry)
+    log_failed = _replicate_log()
     acks = 1 + len(_other_peers()) - len(log_failed)
     _maybe_commit(int(entry["index"]), acks)
     with _lock:
@@ -407,7 +424,7 @@ def delete(key: str) -> dict[str, object]:
         if key not in _store:
             raise HTTPException(status_code=404, detail="key not found")
     entry = _append_log("DELETE", key)
-    log_failed = _replicate_log(entry)
+    log_failed = _replicate_log()
     acks = 1 + len(_other_peers()) - len(log_failed)
     _maybe_commit(int(entry["index"]), acks)
     with _lock:
@@ -422,23 +439,77 @@ def delete(key: str) -> dict[str, object]:
 
 @app.post("/internal/append")
 def receive_append(body: AppendBody) -> dict[str, object]:
+    global _role, _term, _leader, _leader_alive
     with _lock:
-        if body.entry is not None:
-            idx = int(body.entry["index"])
-            expected = len(_log) + 1
-            if idx == expected:
-                _log.append(dict(body.entry))
-                print(f"{_node_id()}: log append {body.entry}", flush=True)
-            elif idx > expected:
+        if body.term < _term:
+            return {
+                "term": _term,
+                "success": False,
+                "last_log_index": len(_log),
+            }
+        if body.term > _term or _role in ("leader", "candidate"):
+            _become_follower(body.term)
+        _term = body.term
+        _role = "follower"
+        _leader = body.leader_id
+        _leader_alive = True
+        _reset_election_timeout()
+
+        if not _prefix_matches(body.prev_log_index, body.prev_log_term):
+            print(
+                f"{_node_id()}: append reject prev_index={body.prev_log_index} "
+                f"prev_term={body.prev_log_term}",
+                flush=True,
+            )
+            return {
+                "term": _term,
+                "success": False,
+                "last_log_index": len(_log),
+            }
+
+        for entry in body.entries:
+            idx = int(entry["index"])
+            if idx <= len(_log):
+                existing_term = int(_log[idx - 1]["term"])
+                incoming_term = int(entry["term"])
+                if existing_term == incoming_term:
+                    continue
+                if idx <= _commit_index:
+                    print(
+                        f"{_node_id()}: refuse truncate committed index={idx}",
+                        flush=True,
+                    )
+                    return {
+                        "term": _term,
+                        "success": False,
+                        "last_log_index": len(_log),
+                    }
                 print(
-                    f"{_node_id()}: skip gap index={idx} expected={expected}",
+                    f"{_node_id()}: conflict at index={idx} "
+                    f"(had term {existing_term}, got {incoming_term}); truncated",
                     flush=True,
                 )
+                del _log[idx - 1 :]
+                _log.append(dict(entry))
+                print(f"{_node_id()}: log append {entry}", flush=True)
+            elif idx == len(_log) + 1:
+                _log.append(dict(entry))
+                print(f"{_node_id()}: log append {entry}", flush=True)
+            else:
+                print(
+                    f"{_node_id()}: skip gap index={idx} expected={len(_log) + 1}",
+                    flush=True,
+                )
+                return {
+                    "term": _term,
+                    "success": False,
+                    "last_log_index": len(_log),
+                }
+
         _advance_commit_from_leader(body.leader_commit)
         return {
-            "appended": body.entry is not None,
-            "node": _node_id(),
-            "commit_index": _commit_index,
+            "term": _term,
+            "success": True,
             "last_log_index": len(_log),
         }
 
@@ -476,7 +547,12 @@ def receive_vote(body: VoteBody) -> dict[str, object]:
             return {"term": _term, "vote_granted": False}
         if body.term > _term:
             _become_follower(body.term)
-        granted = _voted_for is None or _voted_for == body.candidate_id
+        my_index, my_term = _last_log_meta()
+        if body.last_log_term != my_term:
+            log_ok = body.last_log_term > my_term
+        else:
+            log_ok = body.last_log_index >= my_index
+        granted = (_voted_for is None or _voted_for == body.candidate_id) and log_ok
         if granted:
             _voted_for = body.candidate_id
             _reset_election_timeout()

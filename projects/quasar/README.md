@@ -25,39 +25,41 @@ The cluster has three voting members; **majority is two**. The leader counts its
 
 **Terms** increase with each election. A node that hears a higher term steps down (leader or candidate becomes follower). That prevents a stale leader from overriding a newer one after it reconnects.
 
-**Roles:** follower, candidate, leader. Everyone starts as a follower. The leader heartbeats every 250ms. If a follower hears nothing for a randomized 0.8–1.6s, it becomes a candidate: it increments its term, votes for itself, and asks the others. A node grants at most one vote per term. Two votes win.
+**Roles:** follower, candidate, leader. Everyone starts as a follower. The leader heartbeats every 250ms. If a follower hears nothing for a randomized 0.8–1.6s, it becomes a candidate: it increments its term, votes for itself, and asks the others. A node grants at most one vote per term, and only if the candidate’s log is at least as up-to-date. Two votes win.
 
 Writes go only to the current leader. Followers answer `PUT`/`DELETE` with **409** and the leader’s URL.
 
 ## Replication and catch-up
 
-New entries are pushed with `POST /internal/append`. Followers append only the next expected index (`len(log)+1`); a gap is ignored so a lone “entry 5” cannot land on an empty log.
+New entries are pushed with `POST /internal/append`. Each request carries `prev_log_index` and `prev_log_term`. The follower accepts only if it has that exact `(index, term)` prefix. A missing index or a different **entry term** at that index is a reject.
 
-Heartbeats carry `leader_commit`. Followers set `commit_index = min(leader_commit, last log index)` and apply any not-yet-applied entries in order. During catch-up the leader may send several appends, each with the same `leader_commit`; the follower’s commit index still rises one step at a time as `len(log)` grows.
+The leader tracks `next_index` per follower (initialized to `last_log_index + 1`). On reject it decrements `next_index` by one and retries until the prefix matches. Then, if an incoming entry collides at the same index with a different term, the follower deletes that entry and everything after it and appends the leader’s suffix. Committed entries are never deleted. Empty `entries` is a heartbeat: same prefix check, but a matching prefix does not strip a longer uncommitted tail.
 
-If a follower’s log is a **prefix** of the leader’s (including empty after restart), the leader reads `last_log_index` from heartbeat/append replies and sends the missing suffix. Logs that **diverge** at the same index are not rewritten.
+Followers set `commit_index = min(leader_commit, last log index)` and apply newly committed entries in order.
 
 A process restart wipes RAM. Until catch-up, that node has an empty log and map.
 
 ## Architecture
 
-```
-                    Client
-                       |
-              PUT /kv/x  {"value": "10"}
-                       |
-                       v
-                      Leader
-                       |
-            1. Append to the local log
-            2. Replicate the entry (POST /internal/append)
-            3. Advance commit_index once a majority has the entry
-            4. Apply committed entries to the KV map
-            5. Propagate commit_index to followers
-                       |
-              /        |        \
-             v         v         v
-            A          B          C
+A client `PUT` is not applied to the map until a majority of the cluster has the log entry.
+
+```mermaid
+flowchart TB
+    Client(["Client"]) -->|"PUT /kv/x = 10"| Leader
+
+    Leader -->|"1. Append entry to own log"| LeaderLog["Leader Log"]
+
+    LeaderLog -->|"2. Replicate entry"| A["A<br/>follower"]
+    LeaderLog --> B["B<br/>follower"]
+    LeaderLog --> C["C<br/>follower"]
+
+    A --> Majority["3. Majority has entry"]
+    B --> Majority
+    C --> Majority
+
+    Majority --> Commit["Leader advances<br/>commit_index"]
+    Commit -->|"4. Apply committed"| KV["Leader KV map"]
+    KV -->|"5. Tell followers<br/>leader_commit"| Applied["Followers apply<br/>committed entries"]
 ```
 
 ## Requirements
