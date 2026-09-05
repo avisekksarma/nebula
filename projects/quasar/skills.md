@@ -8,7 +8,8 @@ Goal:
 Current stage:
 - Three nodes elect a leader. Leader appends PUT/DELETE to the log and replicates via POST /internal/append (prev_log_index / prev_log_term, entries).
 - Majority (2 of 3) advances commit_index. Committed entries are applied to the KV dict (once). Followers learn commit_index from append/heartbeat.
-- Leader tracks next_index per follower. Prefix mismatch: decrement and retry. Conflicting uncommitted suffix is replaced. No persistence or snapshots yet.
+- Leader tracks next_index per follower. Prefix mismatch: decrement and retry. Conflicting uncommitted suffix is replaced.
+- Raft log is a per-node JSONL WAL (flush + fsync). Term and votedFor are in raft.json. After restart, KV is rebuilt only when the leader sends leader_commit (do not replay the whole WAL). No snapshots yet.
 
 Development philosophy:
 1. Do NOT implement future distributed-system features unless explicitly asked.

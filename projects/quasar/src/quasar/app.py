@@ -32,6 +32,13 @@ _next_index: dict[str, int] = {}
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    _load_meta()  # term/vote before we talk to anyone
+    _load_wal()  # rebuild _log from disk before election/heartbeats
+    # _store stays empty; do not replay the WAL (it may have uncommitted tail)
+    print(
+        f"{_node_id()}: store empty until leader_commit (log={len(_log)})",
+        flush=True,
+    )
     _reset_election_timeout()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     yield
@@ -105,7 +112,7 @@ def _apply_entry(entry: dict[str, str | int]) -> None:
 
 def _apply_committed() -> None:
     global _last_applied
-    while _last_applied < _commit_index:
+    while _last_applied < _commit_index:  # never apply past commit_index
         _last_applied += 1
         entry = _log[_last_applied - 1]
         _apply_entry(entry)
@@ -134,10 +141,102 @@ def _prefix_matches(prev_log_index: int, prev_log_term: int) -> bool:
 
 def _advance_commit_from_leader(leader_commit: int) -> None:
     global _commit_index
-    new = min(leader_commit, len(_log))
+    new = min(leader_commit, len(_log))  # leader tells us; we do not guess
     if new > _commit_index:
         _commit_index = new
-    _apply_committed()
+    _apply_committed()  # same apply path after restart as during a live commit
+
+
+def _data_dir() -> str:
+    return os.environ.get("QUASAR_DATA_DIR") or os.path.join("data", _node_id())
+
+
+def _wal_path() -> str:
+    return os.path.join(_data_dir(), "log.jsonl")
+
+
+def _meta_path() -> str:
+    return os.path.join(_data_dir(), "raft.json")
+
+
+def _persist_meta(term: int, voted_for: str | None) -> None:
+    path = _meta_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(json.dumps({"current_term": term, "voted_for": voted_for}))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _load_meta() -> None:
+    global _term, _voted_for
+    path = _meta_path()
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        _term = int(data["current_term"])
+        voted = data.get("voted_for")
+        _voted_for = None if voted is None else str(voted)
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        print(f"{_node_id()}: meta ignore malformed file", flush=True)
+        return
+    print(
+        f"{_node_id()}: meta loaded term={_term} voted_for={_voted_for}",
+        flush=True,
+    )
+
+
+def _wal_write_lines(fh, entries: list[dict[str, str | int]]) -> None:
+    for entry in entries:
+        fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    fh.flush()
+    os.fsync(fh.fileno())  # durable before we touch _log
+
+
+def _wal_append(entry: dict[str, str | int]) -> None:
+    path = _wal_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a") as fh:
+        _wal_write_lines(fh, [entry])
+
+
+def _wal_rewrite(entries: list[dict[str, str | int]]) -> None:
+    path = _wal_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        _wal_write_lines(fh, entries)
+    os.replace(tmp, path)  # swap in the new file only after it is fsynced
+
+
+def _load_wal() -> None:
+    path = _wal_path()
+    if not os.path.isfile(path):
+        return
+    loaded: list[dict[str, str | int]] = []
+    skipped = False
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                loaded.append(json.loads(line))
+            except json.JSONDecodeError:
+                skipped = True  # crash mid-write: drop the broken last line
+                print(
+                    f"{_node_id()}: wal skip trailing incomplete record",
+                    flush=True,
+                )
+                break
+    _log.extend(loaded)
+    if skipped:
+        _wal_rewrite(loaded)  # strip the junk so a later start does not stop here
+    print(f"{_node_id()}: wal loaded {len(_log)} entries from {path}", flush=True)
 
 
 def _append_log(operation: str, key: str, value: str | None = None) -> dict[str, str | int]:
@@ -150,6 +249,7 @@ def _append_log(operation: str, key: str, value: str | None = None) -> dict[str,
         }
         if value is not None:
             entry["value"] = value
+        _wal_append(entry)  # disk first
         _log.append(entry)
         print(f"{_node_id()}: log append {entry}", flush=True)
         return entry
@@ -255,6 +355,7 @@ def _become_follower(new_term: int | None = None) -> None:
             )
         _term = new_term
         _voted_for = None
+        _persist_meta(_term, _voted_for)  # durable before we act in the new term
         _leader = None
         _leader_alive = False
     _role = "follower"
@@ -278,6 +379,7 @@ def _start_election() -> None:
         _term += 1
         me = _node_id()
         _voted_for = me
+        _persist_meta(_term, _voted_for)  # before RequestVote leaves this node
         _leader = None
         _leader_alive = False
         term = _term
@@ -373,6 +475,7 @@ def health() -> dict[str, str | int | bool | None]:
             "node": _node_id(),
             "role": _role,
             "term": _term,
+            "voted_for": _voted_for,
             "leader": _leader,
             "leader_alive": True if _role == "leader" else _leader_alive,
             "commit_index": _commit_index,
@@ -489,11 +592,14 @@ def receive_append(body: AppendBody) -> dict[str, object]:
                     f"(had term {existing_term}, got {incoming_term}); truncated",
                     flush=True,
                 )
-                del _log[idx - 1 :]
-                _log.append(dict(entry))
+                replaced = _log[: idx - 1] + [dict(entry)]
+                _wal_rewrite(replaced)  # cannot edit a JSONL line; rewrite the file
+                _log[:] = replaced
                 print(f"{_node_id()}: log append {entry}", flush=True)
             elif idx == len(_log) + 1:
-                _log.append(dict(entry))
+                incoming = dict(entry)
+                _wal_append(incoming)  # disk first
+                _log.append(incoming)
                 print(f"{_node_id()}: log append {entry}", flush=True)
             else:
                 print(
@@ -555,6 +661,7 @@ def receive_vote(body: VoteBody) -> dict[str, object]:
         granted = (_voted_for is None or _voted_for == body.candidate_id) and log_ok
         if granted:
             _voted_for = body.candidate_id
+            _persist_meta(_term, _voted_for)  # before the vote response
             _reset_election_timeout()
             print(
                 f"{_node_id()}: granted vote to {body.candidate_id} term={_term}",

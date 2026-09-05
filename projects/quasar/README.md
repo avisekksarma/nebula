@@ -2,7 +2,7 @@
 
 Quasar is a replicated key-value store. A cluster of nodes elects a leader, replicates an ordered log, and applies committed entries to a local key-value map.
 
-Each node is the same FastAPI binary. Cluster membership is passed on the command line (`--peers`). State is held in memory.
+Each node is the same FastAPI binary. Cluster membership is passed on the command line (`--peers`). The Raft log is an append-only WAL (`data/<node-id>/log.jsonl`). Term and vote are in `data/<node-id>/raft.json`. Commit index and the KV map are still in memory.
 
 ## Why a log, not just the map
 
@@ -37,7 +37,7 @@ The leader tracks `next_index` per follower (initialized to `last_log_index + 1`
 
 Followers set `commit_index = min(leader_commit, last log index)` and apply newly committed entries in order.
 
-A process restart wipes RAM. Until catch-up, that node has an empty log and map.
+A process restart reloads the log, term, and vote from disk. Commit index and the KV map start empty. The leader’s `leader_commit` then applies only committed entries (the WAL tail is not replayed).
 
 ## Architecture
 
@@ -93,6 +93,7 @@ Wait about two seconds for election. Stdout shows `candidate` / `granted vote` /
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `8000` | Bind port |
 | `--peers` | (empty) | All nodes as `id=url`, comma-separated. Include this node; it is skipped locally. |
+| `--data-dir` | `data/<node-id>` | This node’s WAL directory. A, B, and C must not share one. |
 
 ## Interactive lab
 
