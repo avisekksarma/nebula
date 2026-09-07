@@ -37,7 +37,7 @@ The leader tracks `next_index` per follower (initialized to `last_log_index + 1`
 
 Followers set `commit_index = min(leader_commit, last log index)` and apply newly committed entries in order.
 
-A process restart reloads the log, term, and vote from disk. Commit index and the KV map start empty. The leader’s `leader_commit` then applies only committed entries (the WAL tail is not replayed).
+A process restart reloads the log, term, and vote from disk. Commit index and the KV map start empty. The leader’s `leader_commit` then applies only committed entries (the WAL tail is not replayed). `POST /snapshot` writes `data/<node-id>/snapshot.json` from the applied map, then drops WAL entries through `last_included_index`. Restart from snapshot is not implemented yet.
 
 ## Architecture
 
@@ -135,6 +135,7 @@ You can still curl `8001`–`8003` in another terminal. That is the same cluster
 | `PUT` | `/kv/{key}` | JSON body `{"value": "..."}` |
 | `GET` | `/kv/{key}` | Read committed value |
 | `DELETE` | `/kv/{key}` | Delete a committed key |
+| `POST` | `/snapshot` | Write a local snapshot of the applied KV map, then drop that prefix from the WAL |
 
 Cluster RPC: `POST /internal/heartbeat`, `/internal/vote`, `/internal/append`.
 

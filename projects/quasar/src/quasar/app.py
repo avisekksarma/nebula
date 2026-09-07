@@ -28,6 +28,8 @@ _last_heard = 0.0
 _leader_alive = False
 _election_timeout = 1.0
 _next_index: dict[str, int] = {}
+_snapshot_index = 0  # last Raft index covered by a local snapshot; 0 = none
+_snapshot_term = 0
 
 
 @asynccontextmanager
@@ -111,37 +113,120 @@ def _apply_entry(entry: dict[str, str | int]) -> None:
 
 
 def _apply_committed() -> None:
+    """Copy committed log entries into the KV map (_store).
+
+    _commit_index is 'the cluster agreed up to here'. _last_applied is 'already
+    in the map'. After a snapshot, entries 1.._snapshot_index are no longer in
+    _log but their effect is already in _store, so we skip those indexes.
+    """
     global _last_applied
-    while _last_applied < _commit_index:  # never apply past commit_index
-        _last_applied += 1
-        entry = _log[_last_applied - 1]
+    while _last_applied < _commit_index:
+        nxt = _last_applied + 1
+        if nxt <= _snapshot_index:
+            _last_applied = nxt
+            continue
+        entry = _entry_at(nxt)
+        if entry is None:
+            break
+        _last_applied = nxt
         _apply_entry(entry)
         print(f"{_node_id()}: apply {entry} (commit_index={_commit_index})", flush=True)
 
 
+def _last_index() -> int:
+    """Raft index of the newest entry this node still knows about.
+
+    Usually that is _log[-1]['index']. If /snapshot compacted the whole log,
+    _log is empty and we return _snapshot_index instead (the last included
+    snapshot entry). Not the same as len(_log), which is only how many
+    leftover lines sit in the list.
+    """
+    if _log:
+        return int(_log[-1]["index"])
+    return _snapshot_index
+
+
 def _last_log_meta() -> tuple[int, int]:
+    """Last log index and last log term, for RequestVote.
+
+    Followers compare this with their own log to decide if the candidate is
+    at least as up-to-date. If the leftover WAL is empty after compaction,
+    the snapshot's last_included index/term is that last log position.
+    """
+    if _log:
+        return int(_log[-1]["index"]), int(_log[-1]["term"])
+    return _snapshot_index, _snapshot_term
+
+
+def _log_pos(index: int) -> int | None:
+    """Turn a Raft log index into a Python list offset in _log.
+
+    Raft indexes are on the entry itself (1, 2, 3, …) and never change.
+    After compaction _log[0] might be Raft index 101, so you cannot use
+    _log[index - 1]. Offset is: this index minus the first leftover index.
+    Returns None if that index is not in the leftover list.
+    """
     if not _log:
-        return 0, 0
-    return len(_log), int(_log[-1]["term"])
+        return None
+    pos = index - int(_log[0]["index"])
+    if pos < 0 or pos >= len(_log):
+        return None
+    return pos
+
+
+def _entry_at(index: int) -> dict[str, str | int] | None:
+    """Return the leftover log entry with this Raft index.
+
+    None means we do not have it in _log: either it was dropped by a snapshot
+    or it has not been replicated to this node yet.
+    """
+    pos = _log_pos(index)
+    if pos is None:
+        return None
+    return _log[pos]
 
 
 def _term_at(index: int) -> int:
-    if index <= 0 or index > len(_log):
+    """Term stored on the log entry at this Raft index.
+
+    Needed for AppendEntries prev_log_term. If the entry was compacted, use
+    the snapshot's last_included_term when index == _snapshot_index.
+    Index 0 (empty log prefix) is term 0.
+    """
+    if index <= 0:
         return 0
-    return int(_log[index - 1]["term"])
+    if index == _snapshot_index:
+        return _snapshot_term
+    entry = _entry_at(index)
+    return 0 if entry is None else int(entry["term"])
 
 
 def _prefix_matches(prev_log_index: int, prev_log_term: int) -> bool:
+    """Does our log match the leader's prefix up to prev_log_index?
+
+    The leader sends (prev_index, prev_term) with each AppendEntries. We
+    accept only if we have that same index with that same term. prev_index 0
+    means 'before the first entry'. If prev_index is exactly the snapshot
+    boundary, compare against _snapshot_term because that entry is gone from _log.
+    """
     if prev_log_index == 0:
         return True
-    if prev_log_index > len(_log):
+    if prev_log_index == _snapshot_index:
+        return prev_log_term == _snapshot_term
+    entry = _entry_at(prev_log_index)
+    if entry is None:
         return False
-    return int(_log[prev_log_index - 1]["term"]) == prev_log_term
+    return int(entry["term"]) == prev_log_term
 
 
 def _advance_commit_from_leader(leader_commit: int) -> None:
+    """Learn commit_index from the leader, then apply newly committed entries.
+
+    We never guess commit_index (it is not on disk). Cap it at our last log
+    index so we do not apply entries we do not have.
+    """
     global _commit_index
-    new = min(leader_commit, len(_log))  # leader tells us; we do not guess
+    new = min(leader_commit, _last_index())  # leader tells us; we do not guess
     if new > _commit_index:
         _commit_index = new
     _apply_committed()  # same apply path after restart as during a live commit
@@ -159,7 +244,54 @@ def _meta_path() -> str:
     return os.path.join(_data_dir(), "raft.json")
 
 
+def _snapshot_path() -> str:
+    return os.path.join(_data_dir(), "snapshot.json")
+
+
+def _write_snapshot() -> dict[str, object] | None:
+    """Write snapshot.json from the applied KV map. Does not delete WAL lines.
+
+    The file is last_included_index (last applied log index), that entry's
+    term, and a copy of _store. fsync before returning. None if nothing
+    has been applied yet.
+    """
+    if _last_applied == 0:
+        return None
+    last_index = _last_applied
+    payload = {
+        "last_included_index": last_index,
+        "last_included_term": _term_at(last_index),
+        "store": dict(_store),
+    }
+    path = _snapshot_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(json.dumps(payload))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return payload
+
+
+def _compact_log(up_to: int) -> None:
+    """Remove log entries with index <= up_to from the WAL and from _log.
+
+    Those entries are already in snapshot.json, so keeping them would be
+    redundant. Must run only after the snapshot is fsynced, or a crash
+    could lose both the old WAL prefix and the snapshot.
+    """
+    remaining = [e for e in _log if int(e["index"]) > up_to]
+    _wal_rewrite(remaining)  # drop prefix only after snapshot is on disk
+    _log[:] = remaining
+
+
 def _persist_meta(term: int, voted_for: str | None) -> None:
+    """Save currentTerm and votedFor to raft.json.
+
+    Must finish (including fsync) before we grant a vote or start an
+    election, so a crash cannot make us vote twice in the same term.
+    """
     path = _meta_path()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
@@ -171,6 +303,11 @@ def _persist_meta(term: int, voted_for: str | None) -> None:
 
 
 def _load_meta() -> None:
+    """On startup, restore term and votedFor from raft.json.
+
+    If the file is missing or not valid JSON, leave the in-memory defaults
+    (term 0, voted_for None) so the node can still start.
+    """
     global _term, _voted_for
     path = _meta_path()
     if not os.path.isfile(path):
@@ -198,6 +335,7 @@ def _wal_write_lines(fh, entries: list[dict[str, str | int]]) -> None:
 
 
 def _wal_append(entry: dict[str, str | int]) -> None:
+    """Append one log entry as a JSON line and fsync before _log.append."""
     path = _wal_path()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "a") as fh:
@@ -205,6 +343,11 @@ def _wal_append(entry: dict[str, str | int]) -> None:
 
 
 def _wal_rewrite(entries: list[dict[str, str | int]]) -> None:
+    """Replace log.jsonl with exactly these entries (tmp file, fsync, rename).
+
+    Used when we compact after a snapshot or when a conflict truncates the
+    uncommitted tail. Cannot edit a single JSONL line in the middle.
+    """
     path = _wal_path()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
@@ -214,6 +357,12 @@ def _wal_rewrite(entries: list[dict[str, str | int]]) -> None:
 
 
 def _load_wal() -> None:
+    """On startup, rebuild _log by reading log.jsonl one JSON object per line.
+
+    If the process crashed while writing the last line, that line is incomplete
+    JSON: skip it and rewrite the file without it. Does not apply entries to
+    _store (uncommitted tail must not go into the map).
+    """
     path = _wal_path()
     if not os.path.isfile(path):
         return
@@ -242,7 +391,7 @@ def _load_wal() -> None:
 def _append_log(operation: str, key: str, value: str | None = None) -> dict[str, str | int]:
     with _lock:
         entry: dict[str, str | int] = {
-            "index": len(_log) + 1,
+            "index": _last_index() + 1,
             "term": _term,
             "operation": operation,
             "key": key,
@@ -260,12 +409,15 @@ def _send_append_entries(node_id: str, addr: str) -> bool:
         with _lock:
             if _role != "leader":
                 return False
-            last = len(_log)
+            last = _last_index()
             ni = min(_next_index.get(node_id, last + 1), last + 1)
+            if ni <= _snapshot_index:
+                ni = _snapshot_index + 1
             _next_index[node_id] = ni
             prev_index = ni - 1
             prev_term = _term_at(prev_index)
-            entries = [dict(e) for e in _log[prev_index:]]
+            start = _log_pos(ni)
+            entries = [] if start is None else [dict(e) for e in _log[start:]]
             payload = {
                 "term": _term,
                 "leader_id": _node_id(),
@@ -291,7 +443,7 @@ def _send_append_entries(node_id: str, addr: str) -> bool:
             if reply.get("success"):
                 _next_index[node_id] = ni + len(entries)
                 return True
-            if ni <= 1:
+            if ni <= _snapshot_index + 1:
                 return False
             _next_index[node_id] = ni - 1
             print(
@@ -419,7 +571,7 @@ def _start_election() -> None:
                     _role = "leader"
                     _leader = me
                     _leader_alive = True
-                    _next_index = {nid: len(_log) + 1 for nid in _other_peers()}
+                    _next_index = {nid: _last_index() + 1 for nid in _other_peers()}
                     print(f"{me}: leader term={term}", flush=True)
                     break
 
@@ -480,6 +632,24 @@ def health() -> dict[str, str | int | bool | None]:
             "leader_alive": True if _role == "leader" else _leader_alive,
             "commit_index": _commit_index,
         }
+
+
+@app.post("/snapshot")
+def create_snapshot() -> dict[str, object]:
+    global _snapshot_index, _snapshot_term
+    with _lock:
+        snap = _write_snapshot()  # fsync first; compact only if that succeeded
+        if snap is None:
+            raise HTTPException(status_code=400, detail="no committed entries to snapshot")
+        _snapshot_index = int(snap["last_included_index"])
+        _snapshot_term = int(snap["last_included_term"])
+        _compact_log(_snapshot_index)
+        print(
+            f"{_node_id()}: snapshot last_included_index={_snapshot_index} "
+            f"last_included_term={_snapshot_term}; wal remaining={len(_log)}",
+            flush=True,
+        )
+        return {"ok": True, "path": _snapshot_path(), **snap}
 
 
 @app.get("/log")
@@ -548,7 +718,7 @@ def receive_append(body: AppendBody) -> dict[str, object]:
             return {
                 "term": _term,
                 "success": False,
-                "last_log_index": len(_log),
+                "last_log_index": _last_index(),
             }
         if body.term > _term or _role in ("leader", "candidate"):
             _become_follower(body.term)
@@ -567,13 +737,14 @@ def receive_append(body: AppendBody) -> dict[str, object]:
             return {
                 "term": _term,
                 "success": False,
-                "last_log_index": len(_log),
+                "last_log_index": _last_index(),
             }
 
         for entry in body.entries:
             idx = int(entry["index"])
-            if idx <= len(_log):
-                existing_term = int(_log[idx - 1]["term"])
+            existing = _entry_at(idx)
+            if existing is not None:
+                existing_term = int(existing["term"])
                 incoming_term = int(entry["term"])
                 if existing_term == incoming_term:
                     continue
@@ -585,38 +756,38 @@ def receive_append(body: AppendBody) -> dict[str, object]:
                     return {
                         "term": _term,
                         "success": False,
-                        "last_log_index": len(_log),
+                        "last_log_index": _last_index(),
                     }
                 print(
                     f"{_node_id()}: conflict at index={idx} "
                     f"(had term {existing_term}, got {incoming_term}); truncated",
                     flush=True,
                 )
-                replaced = _log[: idx - 1] + [dict(entry)]
+                replaced = [e for e in _log if int(e["index"]) < idx] + [dict(entry)]
                 _wal_rewrite(replaced)  # cannot edit a JSONL line; rewrite the file
                 _log[:] = replaced
                 print(f"{_node_id()}: log append {entry}", flush=True)
-            elif idx == len(_log) + 1:
+            elif idx == _last_index() + 1:
                 incoming = dict(entry)
                 _wal_append(incoming)  # disk first
                 _log.append(incoming)
                 print(f"{_node_id()}: log append {entry}", flush=True)
             else:
                 print(
-                    f"{_node_id()}: skip gap index={idx} expected={len(_log) + 1}",
+                    f"{_node_id()}: skip gap index={idx} expected={_last_index() + 1}",
                     flush=True,
                 )
                 return {
                     "term": _term,
                     "success": False,
-                    "last_log_index": len(_log),
+                    "last_log_index": _last_index(),
                 }
 
         _advance_commit_from_leader(body.leader_commit)
         return {
             "term": _term,
             "success": True,
-            "last_log_index": len(_log),
+            "last_log_index": _last_index(),
         }
 
 
@@ -628,7 +799,7 @@ def receive_heartbeat(body: HeartbeatBody) -> dict[str, object]:
             return {
                 "term": _term,
                 "success": False,
-                "last_log_index": len(_log),
+                "last_log_index": _last_index(),
             }
         if body.term > _term or _role in ("leader", "candidate"):
             _become_follower(body.term)
@@ -641,7 +812,7 @@ def receive_heartbeat(body: HeartbeatBody) -> dict[str, object]:
         return {
             "term": _term,
             "success": True,
-            "last_log_index": len(_log),
+            "last_log_index": _last_index(),
         }
 
 
