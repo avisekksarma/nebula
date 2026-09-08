@@ -33,11 +33,11 @@ Writes go only to the current leader. Followers answer `PUT`/`DELETE` with **409
 
 New entries are pushed with `POST /internal/append`. Each request carries `prev_log_index` and `prev_log_term`. The follower accepts only if it has that exact `(index, term)` prefix. A missing index or a different **entry term** at that index is a reject.
 
-The leader tracks `next_index` per follower (initialized to `last_log_index + 1`). On reject it decrements `next_index` by one and retries until the prefix matches. Then, if an incoming entry collides at the same index with a different term, the follower deletes that entry and everything after it and appends the leader’s suffix. Committed entries are never deleted. Empty `entries` is a heartbeat: same prefix check, but a matching prefix does not strip a longer uncommitted tail.
+The leader tracks `next_index` per follower (initialized to `last_log_index + 1`). On reject it decrements `next_index` by one and retries until the prefix matches. If the follower is still behind the leader’s snapshot, those old entries no longer exist: the leader sends `POST /internal/install_snapshot` (one request with last included index/term and the KV map), then resumes AppendEntries from `last_included_index + 1`. Then, if an incoming entry collides at the same index with a different term, the follower deletes that entry and everything after it and appends the leader’s suffix. Committed entries are never deleted. Empty `entries` is a heartbeat: same prefix check, but a matching prefix does not strip a longer uncommitted tail.
 
 Followers set `commit_index = min(leader_commit, last log index)` and apply newly committed entries in order.
 
-A process restart reloads the log, term, and vote from disk. Commit index and the KV map start empty. The leader’s `leader_commit` then applies only committed entries (the WAL tail is not replayed). `POST /snapshot` writes `data/<node-id>/snapshot.json` from the applied map, then drops WAL entries through `last_included_index`. Restart from snapshot is not implemented yet.
+A process restart reloads term, vote, snapshot (if any), then the leftover WAL. The snapshot restores the applied KV through `last_included_index`. Newer WAL entries wait for the leader’s `leader_commit` before they are applied. `POST /snapshot` writes the snapshot then drops that prefix from the WAL.
 
 ## Architecture
 
@@ -131,13 +131,13 @@ You can still curl `8001`–`8003` in another terminal. That is the same cluster
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/health` | `role`, `term`, `leader`, `commit_index` |
-| `GET` | `/log` | Log entries and `commit_index` |
+| `GET` | `/log` | Leftover WAL plus `commit_index`, `snapshot_index`, `last_applied` |
 | `PUT` | `/kv/{key}` | JSON body `{"value": "..."}` |
 | `GET` | `/kv/{key}` | Read committed value |
 | `DELETE` | `/kv/{key}` | Delete a committed key |
 | `POST` | `/snapshot` | Write a local snapshot of the applied KV map, then drop that prefix from the WAL |
 
-Cluster RPC: `POST /internal/heartbeat`, `/internal/vote`, `/internal/append`.
+Cluster RPC: `POST /internal/heartbeat`, `/internal/vote`, `/internal/append`, `/internal/install_snapshot`.
 
 ## Examples
 

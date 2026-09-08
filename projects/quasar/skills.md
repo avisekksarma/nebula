@@ -10,7 +10,7 @@ Current stage:
 - Majority (2 of 3) advances commit_index. Committed entries are applied to the KV dict (once). Followers learn commit_index from append/heartbeat.
 - Leader tracks next_index per follower. Prefix mismatch: decrement and retry. Conflicting uncommitted suffix is replaced.
 - Raft log is a per-node JSONL WAL (flush + fsync). Term and votedFor are in raft.json. After restart, KV is rebuilt only when the leader sends leader_commit (do not replay the whole WAL).
-- Local snapshot: POST /snapshot writes last_included_index/term + applied KV, then compacts the WAL prefix. No InstallSnapshot / restart-from-snapshot yet.
+- Local snapshot: POST /snapshot writes last_included_index/term + applied KV, then compacts the WAL prefix. Restart loads snapshot then leftover WAL (do not replay 1..N). If a follower is behind the snapshot, the leader sends POST /internal/install_snapshot, the follower installs that KV, then AppendEntries continues from last_included_index + 1.
 
 Development philosophy:
 1. Do NOT implement future distributed-system features unless explicitly asked.
