@@ -4,84 +4,77 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Quasar lab</title>
-    <link rel="stylesheet" href="/assets/lab.css" />
+    <link rel="stylesheet" href="/assets/lab.css?v=4" />
   </head>
   <body>
     <header class="top">
       <div class="brand">
         <h1>Quasar lab</h1>
-        <p class="sub">The real 3-node cluster, with the hood open</p>
+        <p class="sub">Three real nodes. Cases on the left. Start / Step below.</p>
       </div>
-      <div class="top-end">
-        <p id="pulse" class="pulse">connecting…</p>
-        <a class="how-btn" href="/how">How this works</a>
-      </div>
+      <p id="cleared" class="cleared">0/6</p>
+      <span id="status" class="status">starting…</span>
+      <button type="button" id="how-btn">How</button>
+      <button type="button" id="reset">Reset cluster</button>
     </header>
 
-    <p id="narration" class="narration">
-      Three nodes will elect a leader. Majority is two. A write is a log entry
-      first; the map is derived from committed entries only.
-    </p>
-
     <div class="shell">
-      <aside class="panel">
-        <h2>Client</h2>
-        <form id="kv-form" class="kv-form">
-          <label>
-            Key
-            <input id="kv-key" name="key" value="x" autocomplete="off" />
-          </label>
-          <label>
-            Value
-            <input id="kv-value" name="value" value="10" autocomplete="off" />
-          </label>
-          <label>
-            Send to
-            <select id="kv-node">
-              <option value="">leader (auto)</option>
-              <option value="A">A</option>
-              <option value="B">B</option>
-              <option value="C">C</option>
-            </select>
-          </label>
-          <div class="row">
-            <button type="submit" data-op="put">PUT</button>
-            <button type="button" data-op="get">GET</button>
-            <button type="button" data-op="delete">DELETE</button>
-          </div>
-        </form>
-        <pre id="kv-result" class="result">PUT / GET / DELETE go through the lab to a real node.</pre>
+      <nav id="missions" class="missions" aria-label="Cases"></nav>
 
-        <h2>Scenarios</h2>
-        <p class="hint">
-          Each one drives the live cluster. Watch the cards and the event log.
-        </p>
-        <div class="scenarios">
-          <button type="button" data-scenario="election">
-            1. Watch an election
-          </button>
-          <button type="button" data-scenario="write">
-            2. A write is a log entry
-          </button>
-          <button type="button" data-scenario="majority">
-            3. Majority of two
-          </button>
-          <button type="button" data-scenario="catchup">
-            4. Kill the leader, then catch-up
-          </button>
+      <div class="workspace">
+        <div class="stage-top">
+          <p id="focus" class="focus">Click <b>01 Election</b> on the left to begin.</p>
+          <p class="legend" title="Log entry colors">
+            <span class="chip applied">applied</span>
+            <span class="chip committed">committed</span>
+            <span class="chip uncommitted">uncommitted</span>
+          </p>
         </div>
-        <button type="button" id="resume-all" class="ghost">Resume all</button>
-      </aside>
+        <section id="cluster" class="cluster"></section>
 
-      <div class="main">
-        <section id="nodes" class="nodes"></section>
-        <section class="timeline-wrap">
-          <h2>Event log</h2>
-          <ol id="timeline"></ol>
-        </section>
+        <footer class="debug" id="debug">
+          <div class="dbg-tools">
+            <button type="button" id="dbg-step" disabled>Start</button>
+            <button type="button" id="dbg-go" disabled>Continue</button>
+            <button type="button" id="dbg-stop" disabled>Stop</button>
+            <ol id="dbg-dots" class="dbg-dots"></ol>
+            <span id="dbg-live" class="dbg-live"></span>
+            <span class="keys"><kbd>S</kbd> step <kbd>C</kbd> continue <kbd>Esc</kbd> stop</span>
+          </div>
+          <div id="dbg-main" class="dbg-main"></div>
+          <form id="kv-form" class="kv">
+            <input id="kv-key" value="x" aria-label="key" autocomplete="off" />
+            <input id="kv-value" value="10" aria-label="value" autocomplete="off" />
+            <button type="submit">PUT</button>
+            <button type="button" id="kv-get">GET</button>
+            <span id="kv-out" class="kv-out"></span>
+          </form>
+        </footer>
       </div>
     </div>
 
-    <script src="/assets/lab.js"></script>
+    <div id="how" class="how hidden" role="dialog" aria-labelledby="how-title">
+      <div class="how-card">
+        <div class="how-head">
+          <h2 id="how-title">How to use this lab</h2>
+          <button type="button" id="how-close">Close</button>
+        </div>
+        <div class="how-body">
+          <p><b>If this page loaded, the lab is already running.</b> You started it with:</p>
+          <pre>uv run --package quasar quasar-lab</pre>
+          <p>Then open <code>http://127.0.0.1:9000</code>. Do not also start A/B/C yourself — this page already did (ports 8001–8003).</p>
+          <ol>
+            <li>Click a case on the left. Start with <b>01 Election</b>.</li>
+            <li>Press <b>Start</b> in the bar under the nodes.</li>
+            <li>Watch A, B, C. Gold ring = the node that just moved. Then press <b>Step</b>.</li>
+            <li>When it asks a question, pick an answer and Step — or <b>Skip guess</b>.</li>
+            <li><b>Continue</b> runs until the next question. <b>Stop</b> gives you the cluster back (Pause / PUT).</li>
+          </ol>
+          <p class="how-foot">Log colors: green = in the map, gold = committed, amber = not committed. Checkmarks stay in this browser so you can come back later and run 01–06 again.</p>
+        </div>
+      </div>
+    </div>
+
+    <script src="/assets/lab.js?v=4"></script>
   </body>
 </html>

@@ -11,6 +11,7 @@ Current stage:
 - Leader tracks next_index per follower. Prefix mismatch: decrement and retry. Conflicting uncommitted suffix is replaced.
 - Raft log is a per-node JSONL WAL (flush + fsync). Term and votedFor are in raft.json. After restart, KV is rebuilt only when the leader sends leader_commit (do not replay the whole WAL).
 - Local snapshot: POST /snapshot writes last_included_index/term + applied KV, then compacts the WAL prefix. Restart loads snapshot then leftover WAL (do not replay 1..N). If a follower is behind the snapshot, the leader sends POST /internal/install_snapshot, the follower installs that KV, then AppendEntries continues from last_included_index + 1.
+- Linearizable GET: followers 409. Leader sends POST /internal/read_confirm (term + leader_id only; no log/KV change). Self + acks must be a majority, else 503. Higher term on a reply uses existing step-down. Value comes from committed _store only.
 
 Development philosophy:
 1. Do NOT implement future distributed-system features unless explicitly asked.

@@ -64,6 +64,20 @@ def _node_id() -> str:
     return os.environ.get("QUASAR_NODE_ID", "A")
 
 
+def _not_leader_error() -> HTTPException:
+    """409 plus whoever we currently believe is leader (may be None)."""
+    with _lock:
+        leader = _leader
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "not the leader",
+            "leader": leader,
+            "leader_url": _peers().get(leader) if leader else None,
+        },
+    )
+
+
 def _require_leader() -> None:
     """Reject client writes unless this node is the current leader.
 
@@ -73,15 +87,80 @@ def _require_leader() -> None:
     with _lock:
         if _role == "leader":
             return
-        leader = _leader
-    raise HTTPException(
-        status_code=409,
-        detail={
-            "error": "not the leader",
-            "leader": leader,
-            "leader_url": _peers().get(leader) if leader else None,
-        },
-    )
+    raise _not_leader_error()
+
+
+def _confirm_leader_majority() -> None:
+    """Leader: ping followers before a linearizable GET.
+
+    Self counts as 1. Majority (2 of 3) must acknowledge this term.
+    HTTP is outside the lock. Higher term → step down, do not return a value.
+    """
+    with _lock:
+        if _role != "leader":
+            is_leader = False
+        else:
+            is_leader = True
+            term = _term
+            me = _node_id()
+    if not is_leader:
+        raise _not_leader_error()
+
+    acks = 1
+    tally = threading.Lock()
+
+    def one(node_id: str, addr: str) -> None:
+        nonlocal acks
+        try:
+            reply = _http_json(
+                "POST",
+                f"{addr}/internal/read_confirm",
+                {"term": term, "leader_id": me},
+                timeout=1.0,
+            )
+        except urllib.error.URLError as exc:
+            print(f"{me}: read confirm to {node_id} failed: {exc}", flush=True)
+            return
+        with _lock:
+            their_term = int(reply.get("term", 0))
+            if their_term > _term:
+                _become_follower(their_term)
+                ok = False
+            elif _role != "leader" or not reply.get("success"):
+                ok = False
+            else:
+                ok = True
+        if ok:
+            with tally:
+                acks += 1
+
+    threads = [
+        threading.Thread(target=one, args=(nid, addr), daemon=True)
+        for nid, addr in _other_peers().items()
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    with _lock:
+        still_leader = _role == "leader"
+        majority = _majority()
+    if not still_leader:
+        raise _not_leader_error()
+    if acks < majority:
+        print(
+            f"{me}: linearizable read denied (acks={acks}/{majority})",
+            flush=True,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "no majority for linearizable read",
+                "acks": acks,
+                "majority": majority,
+            },
+        )
 
 
 def _peers() -> dict[str, str]:
@@ -616,18 +695,45 @@ def _send_install_snapshot(node_id: str, addr: str) -> bool:
 
 
 def _replicate_log() -> list[str]:
-    """Leader: AppendEntries to every other peer. Returns ids that failed."""
-    failed: list[str] = []
-    for node_id, addr in _other_peers().items():
-        if not _send_append_entries(node_id, addr):
-            failed.append(node_id)
-    return failed
+    """Leader: AppendEntries to every other peer in parallel. Returns ids that failed.
+
+    Parallel so one unreachable follower cannot delay the live one past the
+    election timeout (a 1s HTTP timeout is enough to make the other node
+    start an election).
+    """
+    return _send_append_to_all(wait=True)
 
 
 def _push_commit_index() -> None:
     """Leader: send AppendEntries again so followers learn the new commit_index."""
+    _send_append_to_all(wait=True)
+
+
+def _send_append_to_all(*, wait: bool = True) -> list[str]:
+    """AppendEntries every other peer at once.
+
+    wait=True (writes): join so we know who acked. wait=False (heartbeats):
+    do not join, or a paused peer's 1s timeout would stall heartbeats to
+    the live majority and trigger a needless election.
+    """
+    failed: list[str] = []
+    lock = threading.Lock()
+    threads: list[threading.Thread] = []
+
+    def one(node_id: str, addr: str) -> None:
+        if not _send_append_entries(node_id, addr):
+            with lock:
+                failed.append(node_id)
+
     for node_id, addr in _other_peers().items():
-        _send_append_entries(node_id, addr)
+        t = threading.Thread(target=one, args=(node_id, addr), daemon=True)
+        threads.append(t)
+        t.start()
+    if wait:
+        for t in threads:
+            t.join()
+        return failed
+    return []
 
 
 def _maybe_commit(index: int, acks: int) -> None:
@@ -652,13 +758,20 @@ def _maybe_commit(index: int, acks: int) -> None:
 def _http_json(
     method: str, url: str, payload: dict | None = None, timeout: float = 5.0
 ) -> dict:
-    """POST/GET JSON to a peer. Caller must not hold _lock."""
+    """POST/GET JSON to a peer. Caller must not hold _lock.
+
+    Timeouts and dropped connections become URLError so replication/votes
+    treat an unreachable peer as a failed request, not a crash.
+    """
     data = None if payload is None else json.dumps(payload).encode()
     headers = {"Content-Type": "application/json"} if data is not None else {}
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode()
-        return json.loads(raw) if raw else {}
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode()
+            return json.loads(raw) if raw else {}
+    except (TimeoutError, ConnectionError) as exc:
+        raise urllib.error.URLError(exc) from exc
 
 
 def _reset_election_timeout() -> None:
@@ -691,12 +804,11 @@ def _become_follower(new_term: int | None = None) -> None:
 
 
 def _send_heartbeats() -> None:
-    """Leader: AppendEntries to each peer (empty entries if there is nothing new)."""
-    for node_id, addr in _other_peers().items():
-        with _lock:
-            if _role != "leader":
-                return
-        _send_append_entries(node_id, addr)
+    """Leader: AppendEntries to each peer in parallel (empty entries if nothing new)."""
+    with _lock:
+        if _role != "leader":
+            return
+    _send_append_to_all(wait=False)
 
 
 def _start_election() -> None:
@@ -809,6 +921,11 @@ class InstallSnapshotBody(BaseModel):
     store: dict[str, str] = Field(default_factory=dict)
 
 
+class ReadConfirmBody(BaseModel):
+    term: int
+    leader_id: str
+
+
 @app.get("/health")
 def health() -> dict[str, str | int | bool | None]:
     """Role, term, leader, and commit_index for this node."""
@@ -885,8 +1002,16 @@ def put(key: str, body: PutBody) -> dict[str, object]:
 
 @app.get("/kv/{key}")
 def get(key: str) -> dict[str, str]:
-    """Read a committed key from the KV map (not the uncommitted log tail)."""
+    """Linearizable read of a committed key.
+
+    Followers 409. The leader confirms a majority still agrees on this term
+    (no log entry, no KV change), then reads _store only.
+    """
+    _require_leader()
+    _confirm_leader_majority()
     with _lock:
+        if _role != "leader":
+            raise _not_leader_error()
         if key not in _store:
             raise HTTPException(status_code=404, detail="key not found")
         return {"key": key, "value": _store[key]}
@@ -1025,6 +1150,27 @@ def receive_install_snapshot(body: InstallSnapshotBody) -> dict[str, object]:
             body.last_included_term,
             dict(body.store),
         )
+        return {"term": _term, "success": True}
+
+
+@app.post("/internal/read_confirm")
+def receive_read_confirm(body: ReadConfirmBody) -> dict[str, object]:
+    """Follower: acknowledge a leader's linearizable-read check.
+
+    Same term rules as heartbeat/append. Does not touch the log or KV.
+    Stale term → success false so the caller cannot count us in the majority.
+    """
+    global _role, _term, _leader, _leader_alive
+    with _lock:
+        if body.term < _term:
+            return {"term": _term, "success": False}
+        if body.term > _term or _role in ("leader", "candidate"):
+            _become_follower(body.term)
+        _term = body.term
+        _role = "follower"
+        _leader = body.leader_id
+        _leader_alive = True
+        _reset_election_timeout()
         return {"term": _term, "success": True}
 
 

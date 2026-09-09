@@ -97,7 +97,7 @@ Wait about two seconds for election. Stdout shows `candidate` / `granted vote` /
 
 ## Interactive lab
 
-The lab is a website on top of the **same** three-node cluster. It does not implement another KV store or another election. `quasar-lab` starts the real `quasar` processes (A, B, C on 8001–8003) and a site on port 9000.
+The lab is a visual debugger on top of the **same** three-node cluster. It does not implement another KV store or another election. `quasar-lab` starts the real `quasar` processes (A, B, C on 8001–8003, with isolated data under the system temp dir) and a site on port 9000.
 
 ```bash
 uv run --package quasar quasar-lab
@@ -105,26 +105,9 @@ uv run --package quasar quasar-lab
 
 Open [http://127.0.0.1:9000](http://127.0.0.1:9000). Do not also start the three `quasar` commands in the Run section — they bind the same ports.
 
-What used to be curl and extra terminals is on the page:
+The page tells you the next click (gold **How** in the header, and “Do this now” under the nodes). First visit opens How. After that: click **01 Election** → **Start** → **Step**.
 
-| On the site | Same as |
-| --- | --- |
-| Three cards (role, term, log, KV map) | `curl /health` and `/log` on each port |
-| PUT / GET / DELETE | `curl` to `/kv/{key}` (leader, or a node you pick — followers still return **409**) |
-| Pause / Resume | Stop a process, then bring it back with its RAM still there |
-| Restart | Kill and start again — empty log and map until catch-up |
-| Event list | The `candidate` / `granted vote` / `leader` / `apply` lines in stdout |
-
-Guided buttons chain those same actions:
-
-1. **Watch an election** — all three start as followers; a candidate needs two votes to become leader.
-2. **A write is a log entry** — PUT, then watch append → replicate → majority commit → apply to the map. GET reads the map, not the uncommitted tail of the log.
-3. **Majority of two** — pause one follower (write still commits); pause two (entry stays on the log but is not applied).
-4. **Kill the leader, then catch-up** — pause a follower, write, resume (it gets the missing log suffix); pause the leader and wait for a new election.
-
-You can still curl `8001`–`8003` in another terminal. That is the same cluster; the site refreshes on its own. Writes still have to go to whoever `/health` reports as `leader`.
-
-`--host` and `--port` default to `127.0.0.1` and `9000`. Local only; not a hosted multi-user service.
+`--host` and `--port` default to `127.0.0.1` and `9000`. Local only.
 
 ## API
 
@@ -133,11 +116,11 @@ You can still curl `8001`–`8003` in another terminal. That is the same cluster
 | `GET` | `/health` | `role`, `term`, `leader`, `commit_index` |
 | `GET` | `/log` | Leftover WAL plus `commit_index`, `snapshot_index`, `last_applied` |
 | `PUT` | `/kv/{key}` | JSON body `{"value": "..."}` |
-| `GET` | `/kv/{key}` | Read committed value |
+| `GET` | `/kv/{key}` | Linearizable read: leader only, after a majority confirms this term; then the committed KV map |
 | `DELETE` | `/kv/{key}` | Delete a committed key |
 | `POST` | `/snapshot` | Write a local snapshot of the applied KV map, then drop that prefix from the WAL |
 
-Cluster RPC: `POST /internal/heartbeat`, `/internal/vote`, `/internal/append`, `/internal/install_snapshot`.
+Cluster RPC: `POST /internal/heartbeat`, `/internal/vote`, `/internal/append`, `/internal/install_snapshot`, `/internal/read_confirm`.
 
 ## Examples
 
@@ -155,7 +138,6 @@ curl -s -X PUT http://127.0.0.1:8001/kv/x \
   -d '{"value":"10"}'
 
 curl -s http://127.0.0.1:8001/kv/x
-curl -s http://127.0.0.1:8002/kv/x
 curl -s http://127.0.0.1:8003/log
 ```
 
@@ -173,8 +155,9 @@ projects/quasar/
     ├── __init__.py    # node CLI
     ├── __main__.py
     ├── app.py         # cluster / KV backend
-    └── lab/           # interactive website (not part of the node)
+    └── lab/           # visual debugger (not part of the node)
         ├── __init__.py
+        ├── cluster.py
         ├── server.py
         └── static/
 ```
