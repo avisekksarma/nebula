@@ -10,11 +10,17 @@ uv sync --package quasar
 
 ## Quasar
 
-[Quasar](projects/quasar) is a three-node replicated key-value store. The nodes elect a leader, copy writes through an ordered log, and only apply a write to the map once a majority has it. State is in memory; a restart comes back empty until the leader sends what that node missed. If two logs diverge at the same index, the leader walks back until they share a prefix and the follower replaces the rest.
+[Quasar](projects/quasar) is a three-node Raft-style key-value store. The nodes elect a leader, copy `PUT`/`DELETE` through an ordered log, and apply a write to the map only when a majority has it.
 
-Each node is the same FastAPI process. You can run three terminals, or `quasar-lab` — a local page that talks to that same cluster.
+What it covers:
 
-How to run it, the API, and why the log exists are in the [Quasar README](projects/quasar/README.md).
+- **Elections and terms** — follower / candidate / leader; majority is two; a higher term forces an old leader to step down
+- **Replication** — prefix checks, `next_index` catch-up, conflict repair on an uncommitted suffix
+- **Persistence** — per-node WAL and term/vote on disk; restart reloads that state
+- **Snapshots** — compact old log locally; a follower behind the snapshot gets the snapshot, then the leftover log
+- **Linearizable reads** — `GET` is leader-only, and only after the leader confirms it still has a majority
+
+Each node is the same process. Run three terminals, or `quasar-lab` (a local page on the same cluster). How to run it and the API are in the [Quasar README](projects/quasar/README.md).
 
 ## Layout
 

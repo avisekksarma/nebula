@@ -1,66 +1,66 @@
 # Quasar
 
-Quasar is a replicated key-value store. A cluster of nodes elects a leader, replicates an ordered log, and applies committed entries to a local key-value map.
+Quasar is a three-node replicated key-value store. Clients `PUT` / `DELETE` / `GET` keys. The cluster agrees on one ordered log of those operations and applies only **committed** entries to each node’s map.
 
-Each node is the same FastAPI binary. Cluster membership is passed on the command line (`--peers`). The Raft log is an append-only WAL (`data/<node-id>/log.jsonl`). Term and vote are in `data/<node-id>/raft.json`. Commit index and the KV map are still in memory.
+Each node is the same process. Membership is `--peers`. On disk: leftover WAL (`data/<node-id>/log.jsonl`), term/vote (`raft.json`), and an optional snapshot (`snapshot.json`). The live commit index and KV map stay in memory.
+
+## What it does
+
+- **Leader election** — roles are follower, candidate, leader. Majority is two. Terms rise with each election; a higher term steps the old leader down.
+- **Writes** — only the leader accepts `PUT`/`DELETE`. Followers return **409** and the leader URL. The leader appends to its log, replicates, commits when a majority has the entry, then applies to the map.
+- **Catch-up** — a lagging follower gets the missing log suffix. If that suffix is gone (compacted), it gets a snapshot, then the leftover log.
+- **Persistence** — restart reloads term, vote, snapshot (if any), then leftover WAL. Snapshot-covered keys are not replayed. Newer WAL waits for the leader’s `leader_commit`.
+- **Linearizable `GET`** — followers **409**. The leader asks the others for a term/leadership ack, counts itself as one, and only then reads the committed map. No majority → reject, not a stale value.
+
+Not a production database: no leases, no chunked snapshots, no automatic snapshot policy.
 
 ## Why a log, not just the map
 
 Copying `x=10` onto every node is enough while everyone is up. It is not enough to agree on **order** or on **which writes are durable** after a failure.
 
-The **log** is the history of operations (`PUT` / `DELETE`) with a monotonic `index` and the **term** in which they were proposed. The **map** is derived from that history: only entries that have been **committed** are applied. A client `GET` reads the map, not the uncommitted tail of the log.
+The **log** is the history (`PUT` / `DELETE`) with a monotonic `index` and the **term** in which it was proposed. The **map** is derived from that history. A client `GET` reads the map, not the uncommitted tail of the log.
 
-So a write is not “update the dict and hope replicas match.” It is:
+So a write is:
 
 1. Record the operation on the leader’s log.
-2. Copy that log entry to the others.
-3. When a majority of the cluster has the entry, mark it committed.
+2. Copy that entry to the other nodes.
+3. When a majority has it, mark it committed.
 4. Apply committed entries, in index order, to each node’s map.
-
-A node that was down can be sent the log suffix it is missing and then apply up to `commit_index`, instead of being handed an opaque snapshot of the map with no notion of sequence.
 
 ## Consensus in brief
 
-The cluster has three voting members; **majority is two**. The leader counts itself plus each follower that acknowledged the entry. Leader + one live follower is enough to commit; one dead node does not stall the cluster. Two dead nodes cannot form a majority, so those writes stay uncommitted and are not applied.
+Three voting members; **majority is two**. Leader + one live follower can commit. Two dead nodes cannot.
 
-**Terms** increase with each election. A node that hears a higher term steps down (leader or candidate becomes follower). That prevents a stale leader from overriding a newer one after it reconnects.
-
-**Roles:** follower, candidate, leader. Everyone starts as a follower. The leader heartbeats every 250ms. If a follower hears nothing for a randomized 0.8–1.6s, it becomes a candidate: it increments its term, votes for itself, and asks the others. A node grants at most one vote per term, and only if the candidate’s log is at least as up-to-date. Two votes win.
-
-Writes go only to the current leader. Followers answer `PUT`/`DELETE` with **409** and the leader’s URL.
+**Roles:** everyone starts as a follower. The leader heartbeats every 250ms. If a follower hears nothing for a randomized 0.8–1.6s, it becomes a candidate: increment term, vote for itself, ask the others. One vote per term, and only if the candidate’s log is at least as up-to-date. Two votes win.
 
 ## Replication and catch-up
 
-New entries are pushed with `POST /internal/append`. Each request carries `prev_log_index` and `prev_log_term`. The follower accepts only if it has that exact `(index, term)` prefix. A missing index or a different **entry term** at that index is a reject.
+`POST /internal/append` carries `prev_log_index` and `prev_log_term`. The follower accepts only if it has that exact prefix. The leader tracks `next_index` per follower; on reject it decrements and retries. If the follower is still behind the leader’s snapshot, the leader sends `POST /internal/install_snapshot`, then resumes append from `last_included_index + 1`. A conflicting uncommitted suffix is replaced. Committed entries are never deleted.
 
-The leader tracks `next_index` per follower (initialized to `last_log_index + 1`). On reject it decrements `next_index` by one and retries until the prefix matches. If the follower is still behind the leader’s snapshot, those old entries no longer exist: the leader sends `POST /internal/install_snapshot` (one request with last included index/term and the KV map), then resumes AppendEntries from `last_included_index + 1`. Then, if an incoming entry collides at the same index with a different term, the follower deletes that entry and everything after it and appends the leader’s suffix. Committed entries are never deleted. Empty `entries` is a heartbeat: same prefix check, but a matching prefix does not strip a longer uncommitted tail.
-
-Followers set `commit_index = min(leader_commit, last log index)` and apply newly committed entries in order.
-
-A process restart reloads term, vote, snapshot (if any), then the leftover WAL. The snapshot restores the applied KV through `last_included_index`. Newer WAL entries wait for the leader’s `leader_commit` before they are applied. `POST /snapshot` writes the snapshot then drops that prefix from the WAL.
+Followers set `commit_index = min(leader_commit, last log index)` and apply in order. `POST /snapshot` is local: write the applied map, drop that prefix from the WAL. Followers do not snapshot just because the leader did.
 
 ## Architecture
 
-A client `PUT` is not applied to the map until a majority of the cluster has the log entry.
+The leader is one of the three nodes, not a fourth process. Its own log is the first acknowledgement.
 
 ```mermaid
 flowchart TB
-    Client(["Client"]) -->|"PUT /kv/x = 10"| Leader
+    Client(["Client"]) -->|"PUT /kv/x = 10"| A["A leader"]
 
-    Leader -->|"1. Append entry to own log"| LeaderLog["Leader Log"]
+    A -->|"1. Append to own log"| ALog["A log"]
 
-    LeaderLog -->|"2. Replicate entry"| A["A<br/>follower"]
-    LeaderLog --> B["B<br/>follower"]
-    LeaderLog --> C["C<br/>follower"]
+    ALog -->|"2. Replicate"| B["B follower"]
+    ALog --> C["C follower"]
 
-    A --> Majority["3. Majority has entry"]
+    ALog --> Majority["3. Majority = A + one follower"]
     B --> Majority
-    C --> Majority
 
-    Majority --> Commit["Leader advances<br/>commit_index"]
-    Commit -->|"4. Apply committed"| KV["Leader KV map"]
-    KV -->|"5. Tell followers<br/>leader_commit"| Applied["Followers apply<br/>committed entries"]
+    Majority --> Commit["A advances commit_index"]
+    Commit -->|"4. Apply"| AKV["A KV map"]
+    Commit -->|"5. Next append carries leader_commit"| FApply["B and C apply to their maps"]
 ```
+
+`GET` does not go through this write path. The leader confirms a majority still agrees on its term, then reads the committed map.
 
 ## Requirements
 
@@ -93,19 +93,19 @@ Wait about two seconds for election. Stdout shows `candidate` / `granted vote` /
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `8000` | Bind port |
 | `--peers` | (empty) | All nodes as `id=url`, comma-separated. Include this node; it is skipped locally. |
-| `--data-dir` | `data/<node-id>` | This node’s WAL directory. A, B, and C must not share one. |
+| `--data-dir` | `data/<node-id>` | This node’s data directory. A, B, and C must not share one. |
 
 ## Interactive lab
 
-The lab is a visual debugger on top of the **same** three-node cluster. It does not implement another KV store or another election. `quasar-lab` starts the real `quasar` processes (A, B, C on 8001–8003, with isolated data under the system temp dir) and a site on port 9000.
+The lab is a visual debugger on the **same** three-node cluster. It does not implement another store or election. `quasar-lab` starts A, B, C on 8001–8003 (data under the system temp dir) and a site on port 9000.
 
 ```bash
 uv run --package quasar quasar-lab
 ```
 
-Open [http://127.0.0.1:9000](http://127.0.0.1:9000). Do not also start the three `quasar` commands in the Run section — they bind the same ports.
+Open [http://127.0.0.1:9000](http://127.0.0.1:9000). Do not also start the three `quasar` commands above — same ports.
 
-The page tells you the next click (gold **How** in the header, and “Do this now” under the nodes). First visit opens How. After that: click **01 Election** → **Start** → **Step**.
+The page tells you the next click (gold **How** in the header, and “Do this now” under the nodes). First visit opens How. After that: **01 Election** → **Start** → **Step**.
 
 `--host` and `--port` default to `127.0.0.1` and `9000`. Local only.
 
@@ -116,9 +116,9 @@ The page tells you the next click (gold **How** in the header, and “Do this no
 | `GET` | `/health` | `role`, `term`, `leader`, `commit_index` |
 | `GET` | `/log` | Leftover WAL plus `commit_index`, `snapshot_index`, `last_applied` |
 | `PUT` | `/kv/{key}` | JSON body `{"value": "..."}` |
-| `GET` | `/kv/{key}` | Linearizable read: leader only, after a majority confirms this term; then the committed KV map |
+| `GET` | `/kv/{key}` | Linearizable read: leader only, after a majority confirms this term |
 | `DELETE` | `/kv/{key}` | Delete a committed key |
-| `POST` | `/snapshot` | Write a local snapshot of the applied KV map, then drop that prefix from the WAL |
+| `POST` | `/snapshot` | Local snapshot of the applied map, then drop that WAL prefix |
 
 Cluster RPC: `POST /internal/heartbeat`, `/internal/vote`, `/internal/append`, `/internal/install_snapshot`, `/internal/read_confirm`.
 
@@ -141,9 +141,9 @@ curl -s http://127.0.0.1:8001/kv/x
 curl -s http://127.0.0.1:8003/log
 ```
 
-With one follower stopped, writes to the leader still commit. If the leader is stopped, wait for a new election and write to the node `/health` reports as `leader`.
+With one follower stopped, writes to the leader still commit. `GET` on a follower is **409**. If the leader is stopped, wait for a new election and send writes/reads to whoever `/health` reports as `leader`.
 
-After restarting a follower, wait one or two seconds, then compare `/log` and `/kv/...` with the leader.
+After restarting a follower, wait a second or two, then compare `/log` with the leader. `GET` only on the leader.
 
 ## Layout
 
