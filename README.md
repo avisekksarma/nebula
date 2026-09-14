@@ -1,6 +1,6 @@
 # Nebula
 
-This repo is where I build distributed systems from scratch, one project at a time. The root is not an app. It is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/): each project under `projects/` has its own package and dependencies, and they share one lockfile.
+This repo is where I build distributed systems from scratch. The root is not an app. It is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/): each project under `projects/` has its own package and dependencies, and they share one lockfile.
 
 Python 3.13+ and [uv](https://docs.astral.sh/uv/). From this directory:
 
